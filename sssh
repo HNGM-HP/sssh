@@ -1,0 +1,567 @@
+#!/bin/bash
+# Interactive SSH selector with dialog - grouped by SSH config comments
+
+ssh_config="$HOME/.ssh/config"
+dialog_backtitle="sssh · SSH 快捷连接管理器"
+dialog_menu_title=" SSH 主机列表 "
+dialog_manage_title=" 管理 ~/.ssh/config "
+
+dialog_common() {
+    dialog --clear --colors --no-shadow --no-hot-list --backtitle "$dialog_backtitle" "$@"
+}
+
+ensure_dialog() {
+    if command -v dialog >/dev/null 2>&1; then
+        return 0
+    fi
+
+    echo "dialog is not installed. Installing dialog..."
+    if ! command -v apt-get >/dev/null 2>&1; then
+        echo "apt-get not found. Please install dialog manually."
+        exit 1
+    fi
+
+    if [ "$(id -u)" -eq 0 ]; then
+        apt-get update && apt-get install -y dialog
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo apt-get update && sudo apt-get install -y dialog
+    else
+        echo "sudo not found. Please install dialog manually."
+        exit 1
+    fi
+
+    if ! command -v dialog >/dev/null 2>&1; then
+        echo "Failed to install dialog."
+        exit 1
+    fi
+}
+
+load_entries() {
+    python3 << 'PYEOF'
+import os
+
+config_path = os.path.expanduser("~/.ssh/config")
+if not os.path.exists(config_path):
+    raise SystemExit(0)
+
+with open(config_path, "r", encoding="utf-8") as f:
+    content = f.read()
+
+lines = content.split("\n")
+current_group = ""
+i = 0
+
+while i < len(lines):
+    line = lines[i].strip()
+
+    # Group header: comment lines like "# 家庭网络 > 服务器"
+    if line.startswith("#") and not line.startswith("# ==="):
+        comment = line.lstrip("#").strip()
+        if comment and ">" in comment:
+            current_group = " / ".join([p.strip() for p in comment.split(">")])
+        elif comment:
+            current_group = comment
+    elif line.startswith("Host ") and not line.startswith("Host *"):
+        alias = line.split(None, 1)[1].strip()
+        hostname = ""
+        port = "22"
+        j = i + 1
+        while j < len(lines):
+            hline = lines[j].strip()
+            if hline.startswith("Host ") or (hline == "" and hostname):
+                break
+            if hline.startswith("HostName "):
+                hostname = hline.split(None, 1)[1].strip()
+            elif hline.startswith("Port "):
+                port = hline.split(None, 1)[1].strip()
+            j += 1
+
+        if hostname:
+            display = hostname if port == "22" else f"{hostname}:{port}"
+            if current_group:
+                print(f"{current_group} / {alias}\t{alias}\t{display}")
+            else:
+                print(f"{alias}\t{alias}\t{display}")
+    i += 1
+PYEOF
+}
+
+select_host_alias() {
+    local entries="$1"
+    local action="${2:-连接}"
+    local path alias info output status
+    local items=()
+
+    while IFS=$'\t' read -r path alias info; do
+        [ -n "$alias" ] || continue
+        items+=("$alias" "$path    $info")
+    done <<< "$entries"
+
+    [ "${#items[@]}" -gt 0 ] || return 1
+
+    output=$(dialog_common \
+        --no-tags \
+        --title "$dialog_menu_title" \
+        --menu "\Zb\Z4↑↓\Zn 移动  \Zb\Z2Enter\Zn ${action}  \ZbEsc\Zn 退出" \
+        0 0 0 \
+        "${items[@]}" \
+        2>&1 >/dev/tty)
+    status=$?
+
+    [ "$status" -eq 0 ] || return 1
+    [ -n "$output" ] || return 1
+    printf '%s\n' "$output"
+}
+
+build_dialog_items() {
+    local entries="$1"
+    local cols="${COLUMNS:-100}"
+
+    SSSH_COLS="$cols" SSSH_ENTRIES="$entries" python3 << 'PYEOF'
+import os
+import sys
+import unicodedata
+
+cols = int(os.environ.get("SSSH_COLS", "100"))
+desc_width = max(48, min(cols - 18, 96))
+addr_width = 28
+left_width = max(24, desc_width - addr_width - 2)
+
+def width(text):
+    total = 0
+    for char in text:
+        total += 2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1
+    return total
+
+def truncate(text, max_width):
+    result = ""
+    current = 0
+    for char in text:
+        char_width = 2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1
+        if current + char_width > max_width - 2:
+            return result + ".."
+        result += char
+        current += char_width
+    return result
+
+def pad(text, target_width):
+    return text + " " * max(1, target_width - width(text))
+
+for raw in os.environ.get("SSSH_ENTRIES", "").splitlines():
+    parts = raw.split("\t")
+    if len(parts) != 3:
+        continue
+    path, alias, address = parts
+    left = truncate(path, left_width)
+    right = truncate(address, addr_width)
+    print(f"{alias}\t{pad(left, left_width)}  {right}")
+PYEOF
+}
+
+select_host_action() {
+    local entries="$1"
+    local tag desc output status
+    local items=()
+
+    while IFS=$'\t' read -r tag desc; do
+        [ -n "$tag" ] || continue
+        items+=("$tag" "$desc")
+    done < <(build_dialog_items "$entries")
+
+    output=$(dialog_common \
+        --no-tags \
+        --ok-label "连接" \
+        --cancel-label "新增" \
+        --extra-button \
+        --extra-label "修改" \
+        --help-button \
+        --help-label "删除" \
+        --title "$dialog_menu_title" \
+        --menu "\ZbEsc\Zn 退出   \Zb\Z1删除会二次确认\Zn\n\Zb\Z4主机分组/主机名$(printf '%*s' 28 '')主机地址\Zn" \
+        0 0 0 \
+        "${items[@]}" \
+        2>&1 >/dev/tty)
+    status=$?
+
+    case "$status" in
+        0) [ -n "$output" ] && printf 'enter\t%s\n' "$output" ;;
+        1) printf 'n\t\n' ;;
+        2) output="${output#HELP }"; [ -n "$output" ] && printf 'd\t%s\n' "$output" ;;
+        3) [ -n "$output" ] && printf 'e\t%s\n' "$output" ;;
+        *) return 1 ;;
+    esac
+}
+
+prompt_required() {
+    local label="$1"
+    local value="" status
+
+    while [ -z "$value" ]; do
+        value=$(dialog_common --title " $label " --inputbox "$label" 8 70 2>&1 >/dev/tty)
+        status=$?
+        [ "$status" -eq 0 ] || return 1
+    done
+
+    printf '%s\n' "$value"
+}
+
+prompt_default() {
+    local label="$1"
+    local default_value="$2"
+    local value="" status
+
+    value=$(dialog_common --title " $label " --inputbox "$label" 8 70 "$default_value" 2>&1 >/dev/tty)
+    status=$?
+    [ "$status" -eq 0 ] || return 1
+    printf '%s\n' "${value:-$default_value}"
+}
+
+prompt_optional() {
+    local label="$1"
+    local value="" status
+
+    value=$(dialog_common --title " $label " --inputbox "$label" 8 70 2>&1 >/dev/tty)
+    status=$?
+    [ "$status" -eq 0 ] || return 1
+    printf '%s\n' "$value"
+}
+
+ensure_config() {
+    mkdir -p "$(dirname "$ssh_config")"
+    touch "$ssh_config"
+    chmod 600 "$ssh_config"
+}
+
+backup_config() {
+    cp "$ssh_config" "$ssh_config.bak.$(date +%Y%m%d%H%M%S)"
+}
+
+write_config_change() {
+    SSSH_CONFIG="$ssh_config" \
+    SSSH_OP="${SSSH_OP:-}" \
+    SSSH_TARGET_ALIAS="${SSSH_TARGET_ALIAS:-}" \
+    SSSH_ALIAS="${SSSH_ALIAS:-}" \
+    SSSH_HOSTNAME="${SSSH_HOSTNAME:-}" \
+    SSSH_USER="${SSSH_USER:-}" \
+    SSSH_PORT="${SSSH_PORT:-}" \
+    SSSH_IDENTITY_FILE="${SSSH_IDENTITY_FILE:-}" \
+    SSSH_GROUP="${SSSH_GROUP:-}" \
+    python3 << 'PYEOF'
+import os
+import re
+import sys
+
+config_path = os.environ["SSSH_CONFIG"]
+op = os.environ["SSSH_OP"]
+target_alias = os.environ.get("SSSH_TARGET_ALIAS", "")
+alias = os.environ.get("SSSH_ALIAS", "").strip()
+hostname = os.environ.get("SSSH_HOSTNAME", "").strip()
+user = os.environ.get("SSSH_USER", "").strip()
+port = os.environ.get("SSSH_PORT", "").strip()
+identity_file = os.environ.get("SSSH_IDENTITY_FILE", "").strip()
+group = os.environ.get("SSSH_GROUP", "").strip()
+
+def read_config():
+    if not os.path.exists(config_path):
+        return ""
+    with open(config_path, "r", encoding="utf-8") as f:
+        return f.read()
+
+def write_config(content):
+    with open(config_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+def validate_alias(value):
+    if not value:
+        raise SystemExit("Host alias is required")
+    if re.search(r"\s", value):
+        raise SystemExit("Host alias must not contain whitespace")
+
+def host_block(host_alias, host_name, host_user, host_port, host_identity):
+    lines = [f"Host {host_alias}", f"  HostName {host_name}"]
+    if host_user:
+        lines.append(f"  User {host_user}")
+    if host_port:
+        lines.append(f"  Port {host_port}")
+    if host_identity:
+        lines.append(f"  IdentityFile {host_identity}")
+    return "\n".join(lines) + "\n"
+
+def host_ranges(lines):
+    ranges = []
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("Host ") and not stripped.startswith("Host *"):
+            aliases = stripped.split()[1:]
+            end = len(lines)
+            for next_index in range(index + 1, len(lines)):
+                if lines[next_index].strip().startswith("Host "):
+                    end = next_index
+                    break
+            ranges.append((index, end, aliases))
+    return ranges
+
+def find_host(lines, value):
+    for start, end, aliases in host_ranges(lines):
+        if aliases == [value]:
+            return start, end
+    return None
+
+content = read_config()
+lines = content.splitlines()
+
+if op in {"add", "edit"}:
+    validate_alias(alias)
+    if not hostname:
+        raise SystemExit("HostName is required")
+    if port and not port.isdigit():
+        raise SystemExit("Port must be a number")
+
+if op == "add":
+    if find_host(lines, alias):
+        raise SystemExit(f"Host already exists: {alias}")
+    additions = []
+    if group:
+        additions.append(f"# {group}")
+    additions.append(host_block(alias, hostname, user, port, identity_file).rstrip("\n"))
+    prefix = content.rstrip("\n")
+    next_content = (prefix + "\n\n" if prefix else "") + "\n".join(additions) + "\n"
+    write_config(next_content)
+elif op == "edit":
+    if target_alias != alias and find_host(lines, alias):
+        raise SystemExit(f"Host already exists: {alias}")
+    found = find_host(lines, target_alias)
+    if not found:
+        raise SystemExit(f"Host not found: {target_alias}")
+    start, end = found
+    replacement = host_block(alias, hostname, user, port, identity_file).rstrip("\n").splitlines()
+    next_lines = lines[:start] + replacement + lines[end:]
+    write_config("\n".join(next_lines).rstrip("\n") + "\n")
+elif op == "delete":
+    found = find_host(lines, target_alias)
+    if not found:
+        raise SystemExit(f"Host not found: {target_alias}")
+    start, end = found
+    while end < len(lines) and lines[end].strip() == "":
+        end += 1
+        break
+    next_lines = lines[:start] + lines[end:]
+    write_config("\n".join(next_lines).rstrip("\n") + ("\n" if next_lines else ""))
+else:
+    raise SystemExit(f"Unknown operation: {op}")
+PYEOF
+}
+
+get_host_fields() {
+    SSSH_CONFIG="$ssh_config" SSSH_TARGET_ALIAS="$1" python3 << 'PYEOF'
+import os
+
+config_path = os.environ["SSSH_CONFIG"]
+target_alias = os.environ["SSSH_TARGET_ALIAS"]
+
+with open(config_path, "r", encoding="utf-8") as f:
+    lines = f.read().splitlines()
+
+for index, line in enumerate(lines):
+    stripped = line.strip()
+    if not stripped.startswith("Host ") or stripped.startswith("Host *"):
+        continue
+    aliases = stripped.split()[1:]
+    if aliases != [target_alias]:
+        continue
+
+    values = {
+        "alias": target_alias,
+        "hostname": "",
+        "user": "",
+        "port": "22",
+        "identity_file": "",
+    }
+    for next_line in lines[index + 1:]:
+        item = next_line.strip()
+        if item.startswith("Host "):
+            break
+        if item.startswith("HostName "):
+            values["hostname"] = item.split(None, 1)[1].strip()
+        elif item.startswith("User "):
+            values["user"] = item.split(None, 1)[1].strip()
+        elif item.startswith("Port "):
+            values["port"] = item.split(None, 1)[1].strip()
+        elif item.startswith("IdentityFile "):
+            values["identity_file"] = item.split(None, 1)[1].strip()
+    print("\t".join([values["alias"], values["hostname"], values["user"], values["port"], values["identity_file"]]))
+    break
+PYEOF
+}
+
+add_host() {
+    local group alias hostname user port identity_file
+
+    ensure_config
+    group=$(prompt_optional "分组注释，可留空，例如：家庭网络 > 服务器") || return 0
+    alias=$(prompt_required "Host 别名") || return 0
+    hostname=$(prompt_required "HostName 地址") || return 0
+    user=$(prompt_default "User 用户名" "$USER") || return 0
+    port=$(prompt_default "Port 端口" "22") || return 0
+    identity_file=$(prompt_optional "IdentityFile 私钥路径，可留空") || return 0
+
+    backup_config
+    SSSH_OP="add" SSSH_GROUP="$group" SSSH_ALIAS="$alias" SSSH_HOSTNAME="$hostname" SSSH_USER="$user" SSSH_PORT="$port" SSSH_IDENTITY_FILE="$identity_file" write_config_change
+    dialog_common --title " 完成 " --msgbox "\Zb\Z2已新增 Host\Zn\n\n$alias" 8 50
+}
+
+edit_host() {
+    local entries target fields alias hostname user port identity_file
+    local new_alias new_hostname new_user new_port new_identity_file
+
+    entries=$(load_entries)
+    if [ -z "$entries" ]; then
+        echo "No SSH hosts found in config."
+        return 1
+    fi
+
+    target=$(select_host_alias "$entries" "修改") || return 0
+    fields=$(get_host_fields "$target")
+    if [ -z "$fields" ]; then
+        echo "Host is not editable by sssh: $target"
+        return 1
+    fi
+
+    IFS=$'\t' read -r alias hostname user port identity_file <<< "$fields"
+    new_alias=$(prompt_default "Host 别名" "$alias") || return 0
+    new_hostname=$(prompt_default "HostName 地址" "$hostname") || return 0
+    new_user=$(prompt_default "User 用户名" "${user:-$USER}") || return 0
+    new_port=$(prompt_default "Port 端口" "${port:-22}") || return 0
+    new_identity_file=$(prompt_default "IdentityFile 私钥路径，输入 - 删除" "$identity_file") || return 0
+    [ "$new_identity_file" = "-" ] && new_identity_file=""
+
+    backup_config
+    SSSH_OP="edit" SSSH_TARGET_ALIAS="$target" SSSH_ALIAS="$new_alias" SSSH_HOSTNAME="$new_hostname" SSSH_USER="$new_user" SSSH_PORT="$new_port" SSSH_IDENTITY_FILE="$new_identity_file" write_config_change
+    dialog_common --title " 完成 " --msgbox "\Zb\Z2已修改 Host\Zn\n\n$target -> $new_alias" 8 60
+}
+
+delete_host() {
+    local entries target answer
+
+    entries=$(load_entries)
+    if [ -z "$entries" ]; then
+        echo "No SSH hosts found in config."
+        return 1
+    fi
+
+    target=$(select_host_alias "$entries" "删除") || return 0
+    dialog_common --title " 确认删除 " --yesno "\Zb\Z1确认删除 Host？\Zn\n\n$target" 8 60
+    answer=$?
+    if [ "$answer" -ne 0 ]; then
+        return 0
+    fi
+
+    backup_config
+    SSSH_OP="delete" SSSH_TARGET_ALIAS="$target" write_config_change
+    dialog_common --title " 完成 " --msgbox "\Zb\Z2已删除 Host\Zn\n\n$target" 8 50
+}
+
+manage_config() {
+    local action status
+
+    ensure_config
+    action=$(dialog_common \
+        --no-tags \
+        --title "$dialog_manage_title" \
+        --menu "\Zb\Z4↑↓\Zn 移动  \Zb\Z2Enter\Zn 选择  \ZbEsc\Zn 退出" \
+        0 0 0 \
+        "add" "新增 Host" \
+        "edit" "修改 Host" \
+        "delete" "删除 Host" \
+        "exit" "退出" \
+        2>&1 >/dev/tty)
+    status=$?
+
+    [ "$status" -eq 0 ] || exit 0
+
+    case "$action" in
+        add) add_host ;;
+        edit) edit_host ;;
+        delete) delete_host ;;
+        *) exit 0 ;;
+    esac
+}
+
+connect_host() {
+    local entries result action host_alias answer
+    local fields alias hostname user port identity_file
+    local new_alias new_hostname new_user new_port new_identity_file
+
+    if [ ! -f "$ssh_config" ]; then
+        echo "No SSH config found at $ssh_config"
+        exit 1
+    fi
+
+    entries=$(load_entries)
+    if [ -z "$entries" ]; then
+        echo "No SSH hosts found in config."
+        exit 1
+    fi
+
+    result=$(select_host_action "$entries") || exit 0
+    IFS=$'\t' read -r action host_alias <<< "$result"
+
+    case "$action" in
+        n)
+            add_host
+            exit $?
+            ;;
+        e)
+            if [ -z "$host_alias" ]; then
+                edit_host
+                exit $?
+            fi
+            fields=$(get_host_fields "$host_alias")
+            if [ -z "$fields" ]; then
+                echo "Host is not editable by sssh: $host_alias"
+                exit 1
+            fi
+            IFS=$'\t' read -r alias hostname user port identity_file <<< "$fields"
+            new_alias=$(prompt_default "Host 别名" "$alias") || exit 0
+            new_hostname=$(prompt_default "HostName 地址" "$hostname") || exit 0
+            new_user=$(prompt_default "User 用户名" "${user:-$USER}") || exit 0
+            new_port=$(prompt_default "Port 端口" "${port:-22}") || exit 0
+            new_identity_file=$(prompt_default "IdentityFile 私钥路径，输入 - 删除" "$identity_file") || exit 0
+            [ "$new_identity_file" = "-" ] && new_identity_file=""
+            backup_config
+            SSSH_OP="edit" SSSH_TARGET_ALIAS="$host_alias" SSSH_ALIAS="$new_alias" SSSH_HOSTNAME="$new_hostname" SSSH_USER="$new_user" SSSH_PORT="$new_port" SSSH_IDENTITY_FILE="$new_identity_file" write_config_change
+            dialog_common --title " 完成 " --msgbox "\Zb\Z2已修改 Host\Zn\n\n$host_alias -> $new_alias" 8 60
+            exit 0
+            ;;
+        d)
+            if [ -z "$host_alias" ]; then
+                delete_host
+                exit $?
+            fi
+            dialog_common --title " 确认删除 " --yesno "\Zb\Z1确认删除 Host？\Zn\n\n$host_alias" 8 60
+            answer=$?
+            if [ "$answer" -eq 0 ]; then
+                backup_config
+                SSSH_OP="delete" SSSH_TARGET_ALIAS="$host_alias" write_config_change
+                dialog_common --title " 完成 " --msgbox "\Zb\Z2已删除 Host\Zn\n\n$host_alias" 8 50
+            fi
+            exit 0
+            ;;
+    esac
+
+    if [ -n "$host_alias" ]; then
+        echo "Connecting to: $host_alias"
+        ssh "$host_alias"
+    fi
+}
+
+case "${1:-}" in
+    -m|--manage|manage)
+        ensure_dialog
+        manage_config
+        ;;
+    *)
+        ensure_dialog
+        connect_host
+        ;;
+esac
